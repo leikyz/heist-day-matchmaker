@@ -7,20 +7,34 @@ import (
 	"sync"
 )
 
+// ----- Wire types -----
+
 type MatchRequest struct {
-	LobbyID     string `json:"lobby_id"`
-	PlayerCount int    `json:"player_count"`
+	LobbyID     string   `json:"lobby_id"`
+	PlayerCount int      `json:"player_count"`
+	Players     []string `json:"players"` // EOS UniqueNetId strings
 }
 
 type MatchResponse struct {
-	Status string `json:"status"`
-	IP     string `json:"ip"`
-	Team   int    `json:"team"`
+	Status string         `json:"status"`
+	IP     string         `json:"ip"`
+	Teams  map[string]int `json:"teams"` // PlayerId -> team enum value
 }
 
+// ----- Team enum (mirrors Unreal ETeam) -----
+
+const (
+	TeamNone     = 0
+	TeamThief    = 1
+	TeamEmployee = 2
+)
+
+// ----- Matchmaker state -----
+
 type QueuedLobby struct {
+	LobbyID      string
+	Players      []string
 	ResponseChan chan MatchResponse
-	PlayerCount  int
 }
 
 type Matchmaker struct {
@@ -30,58 +44,93 @@ type Matchmaker struct {
 	TargetSize   int
 }
 
+// ----- HTTP handler -----
+
 func (m *Matchmaker) HandleMatchmake(w http.ResponseWriter, r *http.Request) {
 	var req MatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid Request", http.StatusBadRequest)
 		return
 	}
+	if len(req.Players) == 0 {
+		http.Error(w, "No players provided", http.StatusBadRequest)
+		return
+	}
 
 	respChan := make(chan MatchResponse, 1)
 
 	m.mu.Lock()
-	m.Queue = append(m.Queue, QueuedLobby{ResponseChan: respChan, PlayerCount: req.PlayerCount})
-	m.TotalInQueue += req.PlayerCount
 
-	fmt.Printf("[Queue] Lobby joined (%d players). Current: %d/%d\n", req.PlayerCount, m.TotalInQueue, m.TargetSize)
+	m.Queue = append(m.Queue, QueuedLobby{
+		LobbyID:      req.LobbyID,
+		Players:      req.Players,
+		ResponseChan: respChan,
+	})
+	m.TotalInQueue += len(req.Players)
+
+	fmt.Printf("[Queue] Lobby %s joined with %d players %v. Current: %d/%d\n",
+		req.LobbyID, len(req.Players), req.Players, m.TotalInQueue, m.TargetSize)
 
 	if m.TotalInQueue >= m.TargetSize {
-		fmt.Println("Match Found! Dispatched to all clients...")
+		fmt.Println("[Match] Threshold reached, dispatching match...")
+
 		serverIP := "127.0.0.1:7777"
 
-		for i, lobby := range m.Queue {
-			// Even team IDs for first lobby, odd for second
-			team := 0
-			if i > 0 {
-				team = 1
-			}
+		// Pool every player across every queued lobby into one ordered list.
+		allPlayers := make([]string, 0, m.TotalInQueue)
+		for _, lobby := range m.Queue {
+			allPlayers = append(allPlayers, lobby.Players...)
+		}
 
-			lobby.ResponseChan <- MatchResponse{
-				Status: "found",
-				IP:     serverIP,
-				Team:   team,
+		// Assign teams: alternate Thief / Employee.
+		// Adjust this rule to taste (e.g. 1 thief vs many employees).
+		teams := make(map[string]int, len(allPlayers))
+		for i, pid := range allPlayers {
+			if i%2 == 0 {
+				teams[pid] = TeamThief
+			} else {
+				teams[pid] = TeamEmployee
 			}
 		}
 
-		m.Queue = []QueuedLobby{}
+		fmt.Printf("[Match] Server: %s\n", serverIP)
+		for pid, t := range teams {
+			fmt.Printf("[Match]   %s -> team %d\n", pid, t)
+		}
+
+		response := MatchResponse{
+			Status: "found",
+			IP:     serverIP,
+			Teams:  teams,
+		}
+
+		// Send the SAME response to every lobby leader so each client can
+		// look up its own player id in the teams map.
+		for _, lobby := range m.Queue {
+			lobby.ResponseChan <- response
+		}
+
+		m.Queue = m.Queue[:0]
 		m.TotalInQueue = 0
 	}
+
 	m.mu.Unlock()
 
-	// Wait for the result from the channel
+	// Block until our channel is fed by the dispatch above.
 	result := <-respChan
 
-	// CRITICAL: Send as JSON only
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func main() {
-	// TargetSize 2 means the match starts as soon as 2 players are found (total)
+	// TargetSize = total players needed across all queued lobbies before a match dispatches.
 	mm := &Matchmaker{TargetSize: 2}
 
 	http.HandleFunc("/matchmake", mm.HandleMatchmake)
 
-	fmt.Println("JSON-Only Matchmaker running on :8080")
-	http.ListenAndServe(":8080", nil)
+	fmt.Println("Matchmaker listening on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Println("server error:", err)
+	}
 }
